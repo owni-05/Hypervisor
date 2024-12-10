@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from backend_service.core.config import Settings
 
 def create_application() -> FastAPI:
     """
@@ -12,6 +13,14 @@ def create_application() -> FastAPI:
         title=Settings.PROJECT_NAME,
         description="Backend Service for Cluster Management and Deployment",
         version="0.1.0"
+    )
+    # CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=Settings.ALLOWED_HOSTS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
 
