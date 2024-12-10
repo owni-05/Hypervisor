@@ -8,3 +8,4 @@ python-multipart==0.0.6
 psycopg2-binary==2.9.6
 redis==4.5.4
 alembic==1.10.3
+python-dotenv==0.21.1
