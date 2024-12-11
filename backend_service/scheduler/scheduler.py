@@ -17,6 +17,7 @@ class PriorityScheduler:
         self.QUEUE_KEY = "deployment:queue"  # Sorted set for priority queue
         self.RESOURCE_KEY = "cluster:resources:{}"  # Hash for cluster resources
         self.DEPLOYMENT_KEY = "deployment:info:{}"  # Hash for deployment details
+        self.RESOURCE_SCALE = 1000 #to convert to int
 
         # Priority ranges (higher number = higher priority)
         self.PRIORITY_RANGES = {
@@ -39,6 +40,7 @@ class PriorityScheduler:
             'total_gpu': int(cluster.total_gpu * self.RESOURCE_SCALE)
         }
 
+        # noinspection PyDeprecation
         self.redis.hmset(
             self.RESOURCE_KEY.format(cluster.id),
             scaled_resources
@@ -216,7 +218,7 @@ class PriorityScheduler:
 
         return scheduled
 
-    RESOURCE_SCALE = 1000
+
 
     def _scale_resources(self, resources: Dict) -> Dict:
         """Convert float resources to scaled integers"""
@@ -263,6 +265,8 @@ class PriorityScheduler:
         except Exception as e:
             logger.error(f"Error starting deployment: {str(e)}")
             return False
+
+
     def get_queue_metrics(self) -> Dict:
         """Get metrics about the current queue state"""
         try:
@@ -349,3 +353,139 @@ class PriorityScheduler:
         except Exception as e:
             logger.error(f"Error rebalancing queue: {str(e)}")
             return False
+
+
+    def complete_deployment(
+            self,
+            deployment_id: int,
+            status: DeploymentStatus,
+            completion_details: Optional[Dict] = None
+    ) -> bool:
+        """
+        Handle deployment completion - marks as complete, releases resources, updates queue
+        """
+        try:
+            # Get deployment
+            deployment = self.db.query(Deployment).get(deployment_id)
+            if not deployment:
+                logger.error(f"Deployment {deployment_id} not found")
+                return False
+
+            # Release resources back to cluster
+            resources = {
+                'ram': deployment.required_ram,
+                'cpu': deployment.required_cpu,
+                'gpu': deployment.required_gpu
+            }
+
+            # Update deployment status in database
+            deployment.status = status
+            deployment.completed_at = datetime.utcnow()
+
+            if completion_details:
+                deployment.completion_details = completion_details
+
+            # Remove from Redis and release resources
+            with self.redis.pipeline() as pipe:
+                # Remove from queue if still there
+                pipe.zrem(self.QUEUE_KEY, str(deployment_id))
+
+                # Remove deployment info
+                pipe.delete(self.DEPLOYMENT_KEY.format(deployment_id))
+
+                pipe.execute()
+
+            # Release cluster resources
+            self.release_resources(deployment.cluster_id, resources)
+
+            # Commit database changes
+            self.db.commit()
+
+            # Process next pending deployments
+            next_deployments = self.process_deployments(deployment.cluster_id)
+            if next_deployments:
+                logger.info(f"Scheduled {len(next_deployments)} deployments after completion")
+
+            logger.info(f"Deployment {deployment_id} completed with status {status}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error completing deployment {deployment_id}: {str(e)}")
+            self.db.rollback()
+            return False
+
+    def handle_deployment_timeout(self, deployment_id: int) -> bool:
+        """Handle deployments that have timed out"""
+        try:
+            deployment = self.db.query(Deployment).get(deployment_id)
+            if not deployment or deployment.status != DeploymentStatus.RUNNING:
+                return False
+
+            # Check if deployment has exceeded timeout
+            if deployment.started_at:
+                elapsed_time = datetime.utcnow() - deployment.started_at
+                if elapsed_time.total_seconds() > 3600:  # 1 hour timeout
+                    return self.complete_deployment(
+                        deployment_id,
+                        DeploymentStatus.FAILED,
+                        {"reason": "Deployment timed out"}
+                    )
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error handling deployment timeout: {str(e)}")
+            return False
+
+    def handle_failed_deployment(
+            self,
+            deployment_id: int,
+            error_details: Dict
+    ) -> bool:
+        """Handle failed deployments"""
+        return self.complete_deployment(
+            deployment_id,
+            DeploymentStatus.FAILED,
+            {"error": error_details}
+        )
+
+    def handle_successful_deployment(
+            self,
+            deployment_id: int,
+            success_details: Optional[Dict] = None
+    ) -> bool:
+        """Handle successful deployments"""
+        return self.complete_deployment(
+            deployment_id,
+            DeploymentStatus.COMPLETED,
+            success_details
+        )
+
+    def get_deployment_status(
+            self,
+            deployment_id: int
+    ) -> Optional[Dict]:
+        """Get detailed deployment status"""
+        try:
+            # Get from database
+            deployment = self.db.query(Deployment).get(deployment_id)
+            if not deployment:
+                return None
+
+            # Get Redis info if available
+            deployment_info = self.redis.hgetall(
+                self.DEPLOYMENT_KEY.format(deployment_id)
+            )
+
+            return {
+                "id": deployment.id,
+                "status": deployment.status,
+                "started_at": deployment.started_at,
+                "completed_at": deployment.completed_at,
+                "completion_details": getattr(deployment, 'completion_details', None),
+                "queue_info": deployment_info if deployment_info else None
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting deployment status: {str(e)}")
+            return None
