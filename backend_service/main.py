@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import List
 import secrets
-
+import json
+import os
 from .database.base import get_db
 from .database.operations import DatabaseOperations
 from .auth import get_current_user, create_access_token, get_password_hash, verify_password
@@ -14,9 +15,28 @@ from .schemas.schemas import (
 )
 from .models.auth import User
 from .models.organisation import Organization
-from .models.cluster import Cluster
+from .models.cluster import Cluster, DeploymentStatus,Deployment
+from redis import Redis
+from .scheduler.scheduler import PriorityScheduler
+
 
 app = FastAPI(title="Backend Cluster Service")
+
+# Initialize Redis and scheduler
+redis_client = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    db=int(os.getenv('REDIS_DB', 0)),
+    decode_responses=True
+)
+
+scheduler = None
+
+@app.on_event("startup")
+async def startup_event():
+    global scheduler
+    db = next(get_db())
+    scheduler = PriorityScheduler(db, redis_client)
 
 # Authentication routes
 @app.post("/token", response_model=Token)
@@ -98,29 +118,19 @@ async def create_cluster(
         total_gpu=cluster.total_gpu
     )
 
-# Deployment routes
+
+#deployemnt routes
+
 @app.post("/deployments/", response_model=DeploymentResponse)
 async def create_deployment(
         deployment: DeploymentCreate,
         current_user: User = Depends(get_current_user),
         db: Session = Depends(get_db)
 ):
-    # Verify cluster exists and user has access
-    cluster = db.query(Cluster).filter(Cluster.id == deployment.cluster_id).first()
-    if not cluster:
-        raise HTTPException(status_code=404, detail="Cluster not found")
+    # ... (existing validation code) ...
 
-    member = DatabaseOperations.get_organization_member(db, current_user.id, cluster.organization_id)
-    if not member:
-        raise HTTPException(status_code=403, detail="Not authorized to deploy to this cluster")
-
-    # Check resource availability
-    if (cluster.available_ram < deployment.required_ram or
-            cluster.available_cpu < deployment.required_cpu or
-            cluster.available_gpu < deployment.required_gpu):
-        raise HTTPException(status_code=400, detail="Insufficient cluster resources")
-
-    return DatabaseOperations.create_deployment(
+    # Create deployment
+    db_deployment = DatabaseOperations.create_deployment(
         db=db,
         name=deployment.name,
         docker_image=deployment.docker_image,
@@ -132,13 +142,52 @@ async def create_deployment(
         required_gpu=deployment.required_gpu
     )
 
-@app.get("/deployments/cluster/{cluster_id}", response_model=List[DeploymentResponse])
-async def list_deployments(
+    # Add to priority queue
+    if not scheduler.enqueue_deployment(db_deployment):
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to schedule deployment"
+        )
+
+    return db_deployment
+
+# Add queue monitoring endpoint
+@app.get("/deployments/queue/metrics")
+async def get_queue_metrics(
+        current_user: User = Depends(get_current_user)
+):
+    """Get metrics about the deployment queue"""
+    return scheduler.get_queue_metrics()
+
+# Add queue rebalancing endpoint (admin only)
+@app.post("/deployments/queue/rebalance")
+async def rebalance_queue(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Rebalance queue priorities"""
+    # Check if user is admin
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only admins can rebalance the queue"
+        )
+
+    if scheduler.rebalance_queue():
+        return {"message": "Queue rebalanced successfully"}
+    raise HTTPException(
+        status_code=500,
+        detail="Failed to rebalance queue"
+    )
+
+@app.get("/clusters/{cluster_id}/resources")
+async def get_cluster_resources(
         cluster_id: int,
         current_user: User = Depends(get_current_user),
         db: Session = Depends(get_db)
 ):
-    # Verify cluster exists and user has access
+    """Get current resource allocation for a cluster"""
+    # Verify access
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
@@ -147,4 +196,111 @@ async def list_deployments(
     if not member:
         raise HTTPException(status_code=403, detail="Not authorized to view this cluster")
 
-    return DatabaseOperations.get_pending_deployments(db, cluster_id)
+    # Update and get cluster resources
+    scheduler.update_cluster_resources(cluster)
+    return scheduler.get_cluster_resources(cluster_id)
+
+# Process pending deployments for a cluster
+@app.post("/clusters/{cluster_id}/process-deployments")
+async def process_cluster_deployments(
+        cluster_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Process pending deployments for a cluster"""
+    # Verify admin access
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    member = DatabaseOperations.get_organization_member(db, current_user.id, cluster.organization_id)
+    if not member or member.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to process deployments")
+
+    scheduled = scheduler.process_deployments(cluster_id)
+    return {
+        "message": f"Processed {len(scheduled)} deployments",
+        "scheduled_deployments": scheduled
+    }
+
+# Get next deployment to be processed
+@app.get("/clusters/{cluster_id}/next-deployment")
+async def get_next_deployment(
+        cluster_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Get information about the next deployment to be processed"""
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    member = DatabaseOperations.get_organization_member(db, current_user.id, cluster.organization_id)
+    if not member:
+        raise HTTPException(status_code=403, detail="Not authorized to view this cluster")
+
+    next_deployment = scheduler.get_next_deployment(cluster_id)
+    if not next_deployment:
+        raise HTTPException(status_code=404, detail="No pending deployments")
+    return next_deployment
+
+# Release resources when deployment is complete
+@app.post("/deployments/{deployment_id}/release")
+async def release_deployment_resources(
+        deployment_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Release resources when a deployment is complete"""
+    deployment = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+
+    # Verify access
+    cluster = db.query(Cluster).filter(Cluster.id == deployment.cluster_id).first()
+    member = DatabaseOperations.get_organization_member(db, current_user.id, cluster.organization_id)
+    if not member or member.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to release resources")
+
+    resources = {
+        'ram': deployment.required_ram,
+        'cpu': deployment.required_cpu,
+        'gpu': deployment.required_gpu
+    }
+
+    scheduler.release_resources(deployment.cluster_id, resources)
+    return {"message": "Resources released successfully"}
+
+# Start a specific deployment
+@app.post("/deployments/{deployment_id}/start")
+async def start_deployment(
+        deployment_id: int,
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Manually start a specific deployment"""
+    deployment = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+    if not deployment:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+
+    # Verify access
+    cluster = db.query(Cluster).filter(Cluster.id == deployment.cluster_id).first()
+    member = DatabaseOperations.get_organization_member(db, current_user.id, cluster.organization_id)
+    if not member or member.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to start deployments")
+
+    resources = {
+        'ram': deployment.required_ram,
+        'cpu': deployment.required_cpu,
+        'gpu': deployment.required_gpu
+    }
+
+    success = scheduler.start_deployment(
+        deployment.cluster_id,
+        deployment_id,
+        resources
+    )
+
+    if success:
+        return {"message": "Deployment started successfully"}
+    raise HTTPException(status_code=400, detail="Failed to start deployment")
