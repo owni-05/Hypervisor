@@ -105,17 +105,15 @@ class PriorityScheduler:
     def enqueue_deployment(self, deployment: Deployment) -> bool:
         """Add deployment to priority queue"""
         try:
-            # Prepare deployment info
+            # Prepare deployment info as a flat dictionary with string values
             deployment_info = {
-                'id': deployment.id,
+                'id': str(deployment.id),
                 'name': deployment.name,
-                'cluster_id': deployment.cluster_id,
-                'priority': deployment.priority,
-                'required_resources': {
-                    'ram': deployment.required_ram,
-                    'cpu': deployment.required_cpu,
-                    'gpu': deployment.required_gpu
-                },
+                'cluster_id': str(deployment.cluster_id),
+                'priority': str(deployment.priority),
+                'required_ram': str(deployment.required_ram),
+                'required_cpu': str(deployment.required_cpu),
+                'required_gpu': str(deployment.required_gpu),
                 'created_at': deployment.created_at.isoformat()
             }
 
@@ -127,10 +125,10 @@ class PriorityScheduler:
 
             # Use Redis transaction to ensure atomic operations
             with self.redis.pipeline() as pipe:
-                # Store deployment info
-                pipe.hmset(
+                # Store deployment info using hset
+                pipe.hset(
                     self.DEPLOYMENT_KEY.format(deployment.id),
-                    deployment_info
+                    mapping=deployment_info
                 )
 
                 # Add to priority queue
@@ -164,6 +162,7 @@ class PriorityScheduler:
             )
 
             for deployment_id, score in pending_deployments:
+                # Get deployment info from Redis
                 deployment_info = self.redis.hgetall(
                     self.DEPLOYMENT_KEY.format(deployment_id)
                 )
@@ -171,15 +170,28 @@ class PriorityScheduler:
                 if not deployment_info:
                     continue
 
+                # Convert stored string values back to appropriate types
+                deployment_info['id'] = int(deployment_info['id'])
+                deployment_info['cluster_id'] = int(deployment_info['cluster_id'])
+                deployment_info['priority'] = int(deployment_info['priority'])
+                deployment_info['required_ram'] = float(deployment_info['required_ram'])
+                deployment_info['required_cpu'] = float(deployment_info['required_cpu'])
+                deployment_info['required_gpu'] = float(deployment_info['required_gpu'])
+
                 # Check if deployment belongs to this cluster
-                if int(deployment_info['cluster_id']) != cluster_id:
+                if deployment_info['cluster_id'] != cluster_id:
                     continue
 
                 # Check resource requirements
-                required = json.loads(deployment_info['required_resources'])
-                if self.can_schedule(resources, required):
+                required_resources = {
+                    'ram': deployment_info['required_ram'],
+                    'cpu': deployment_info['required_cpu'],
+                    'gpu': deployment_info['required_gpu']
+                }
+
+                if self.can_schedule(resources, required_resources):
                     return {
-                        'id': deployment_id,
+                        'id': deployment_info['id'],
                         'info': deployment_info,
                         'score': score
                     }
@@ -189,6 +201,7 @@ class PriorityScheduler:
         except Exception as e:
             logger.error(f"Error getting next deployment: {str(e)}")
             return None
+
 
 
 
