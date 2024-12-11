@@ -1,10 +1,8 @@
-
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, func
 from sqlalchemy.orm import relationship
-from ..database.base import OrganizationBase
-from .auth import User
+from ..database.base import Base
 
-class Organization(OrganizationBase):
+class Organization(Base):
     __tablename__ = 'organizations'
     __table_args__ = {'schema': 'organization'}
 
@@ -13,7 +11,7 @@ class Organization(OrganizationBase):
     invite_code = Column(String(255), unique=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-class OrganizationMember(OrganizationBase):
+class OrganizationMember(Base):
     __tablename__ = 'members'
     __table_args__ = {'schema': 'organization'}
 

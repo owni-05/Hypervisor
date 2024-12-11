@@ -1,8 +1,8 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.orm import relationship
-from ..database.base import AuthBase
+from ..database.base import Base
 
-class User(AuthBase):
+class User(Base):
     __tablename__ = 'users'
     __table_args__ = {'schema': 'auth'}
 
@@ -13,6 +13,3 @@ class User(AuthBase):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-
-

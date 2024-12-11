@@ -1,7 +1,6 @@
-
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, func
 from sqlalchemy.orm import relationship
-from ..database.base import ClusterBase
+from ..database.base import Base
 import enum
 
 class DeploymentStatus(str, enum.Enum):
@@ -11,7 +10,7 @@ class DeploymentStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
-class Cluster(ClusterBase):
+class Cluster(Base):
     __tablename__ = 'clusters'
     __table_args__ = {'schema': 'cluster'}
 
@@ -26,7 +25,7 @@ class Cluster(ClusterBase):
     available_gpu = Column(Float, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-class Deployment(ClusterBase):
+class Deployment(Base):
     __tablename__ = 'deployments'
     __table_args__ = {'schema': 'cluster'}
 
