@@ -12,12 +12,13 @@ class PriorityScheduler:
     def __init__(self, db: Session, redis_client: redis.Redis):
         self.db = db
         self.redis = redis_client
+        self.DEPLOYMENT_TIMEOUT = 3600  # 1 hour in seconds
+        self.RESOURCE_SCALE = 1000  # Scale factor for float to int conversion
 
         # Redis key prefixes
         self.QUEUE_KEY = "deployment:queue"  # Sorted set for priority queue
         self.RESOURCE_KEY = "cluster:resources:{}"  # Hash for cluster resources
         self.DEPLOYMENT_KEY = "deployment:info:{}"  # Hash for deployment details
-        self.RESOURCE_SCALE = 1000 #to convert to int
 
         # Priority ranges (higher number = higher priority)
         self.PRIORITY_RANGES = {
@@ -27,80 +28,55 @@ class PriorityScheduler:
             "low": (100, 399),        # Priority 1-3
         }
 
-
     def update_cluster_resources(self, cluster: Cluster) -> None:
         """Update cluster resources in Redis"""
-        # Scale resources to integers
-        scaled_resources = {
-            'ram': int(cluster.available_ram * self.RESOURCE_SCALE),
-            'cpu': int(cluster.available_cpu * self.RESOURCE_SCALE),
-            'gpu': int(cluster.available_gpu * self.RESOURCE_SCALE),
-            'total_ram': int(cluster.total_ram * self.RESOURCE_SCALE),
-            'total_cpu': int(cluster.total_cpu * self.RESOURCE_SCALE),
-            'total_gpu': int(cluster.total_gpu * self.RESOURCE_SCALE)
-        }
+        try:
+            # Scale resources to integers
+            scaled_resources = {
+                'ram': int(cluster.available_ram * self.RESOURCE_SCALE),
+                'cpu': int(cluster.available_cpu * self.RESOURCE_SCALE),
+                'gpu': int(cluster.available_gpu * self.RESOURCE_SCALE),
+                'total_ram': int(cluster.total_ram * self.RESOURCE_SCALE),
+                'total_cpu': int(cluster.total_cpu * self.RESOURCE_SCALE),
+                'total_gpu': int(cluster.total_gpu * self.RESOURCE_SCALE)
+            }
 
-        # noinspection PyDeprecation
-        self.redis.hmset(
-            self.RESOURCE_KEY.format(cluster.id),
-            scaled_resources
-        )
+            # Validate resources are not negative
+            if any(value < 0 for value in scaled_resources.values()):
+                raise ValueError("Resource values cannot be negative")
+
+            self.redis.hset(
+                self.RESOURCE_KEY.format(cluster.id),
+                mapping=scaled_resources
+            )
+            logger.info(f"Updated resources for cluster {cluster.id}")
+
+        except Exception as e:
+            logger.error(f"Error updating cluster resources: {e}")
+            raise
 
     def get_cluster_resources(self, cluster_id: int) -> Dict:
         """Get cluster resources from Redis"""
-        resource_key = self.RESOURCE_KEY.format(cluster_id)
-        scaled_resources = self.redis.hgetall(resource_key)
-
-        if not scaled_resources:
-            return {}
-
-        # Convert back to floats
-        return {
-            'ram': float(scaled_resources['ram']) / self.RESOURCE_SCALE,
-            'cpu': float(scaled_resources['cpu']) / self.RESOURCE_SCALE,
-            'gpu': float(scaled_resources['gpu']) / self.RESOURCE_SCALE,
-            'total_ram': float(scaled_resources['total_ram']) / self.RESOURCE_SCALE,
-            'total_cpu': float(scaled_resources['total_cpu']) / self.RESOURCE_SCALE,
-            'total_gpu': float(scaled_resources['total_gpu']) / self.RESOURCE_SCALE
-        }
-
-    def can_schedule(self, available: Dict, required: Dict) -> bool:
-        """Check if required resources are available"""
-        # Scale both available and required resources
-        scaled_available = self._scale_resources(available)
-        scaled_required = self._scale_resources(required)
-
-        return (
-                scaled_available['ram'] >= scaled_required['ram'] and
-                scaled_available['cpu'] >= scaled_required['cpu'] and
-                scaled_available['gpu'] >= scaled_required['gpu']
-        )
-
-    def release_resources(self, cluster_id: int, resources: Dict) -> None:
-        """Release resources back to the cluster"""
         try:
-            # Scale resources to integers
-            scaled_resources = self._scale_resources(resources)
             resource_key = self.RESOURCE_KEY.format(cluster_id)
+            scaled_resources = self.redis.hgetall(resource_key)
 
-            with self.redis.pipeline() as pipe:
-                pipe.hincrby(resource_key, 'ram', scaled_resources['ram'])
-                pipe.hincrby(resource_key, 'cpu', scaled_resources['cpu'])
-                pipe.hincrby(resource_key, 'gpu', scaled_resources['gpu'])
-                pipe.execute()
+            if not scaled_resources:
+                logger.warning(f"No resources found for cluster {cluster_id}")
+                return {}
 
+            # Convert back to floats
+            return {
+                'ram': float(scaled_resources['ram']) / self.RESOURCE_SCALE,
+                'cpu': float(scaled_resources['cpu']) / self.RESOURCE_SCALE,
+                'gpu': float(scaled_resources['gpu']) / self.RESOURCE_SCALE,
+                'total_ram': float(scaled_resources['total_ram']) / self.RESOURCE_SCALE,
+                'total_cpu': float(scaled_resources['total_cpu']) / self.RESOURCE_SCALE,
+                'total_gpu': float(scaled_resources['total_gpu']) / self.RESOURCE_SCALE
+            }
         except Exception as e:
-            logger.error(f"Error releasing resources: {str(e)}")
-            raise
-
-    def calculate_priority_score(self, priority: int, created_at: datetime) -> float:
-        """
-        Calculate priority score for sorting.
-        Combines priority level with creation time to maintain FIFO within same priority.
-        """
-        base_score = priority * 10000  # Priority is the main factor
-        time_score = created_at.timestamp()  # Earlier times get priority within same level
-        return base_score - time_score
+            logger.error(f"Error getting cluster resources: {e}")
+            return {}
 
     def enqueue_deployment(self, deployment: Deployment) -> bool:
         """Add deployment to priority queue"""
@@ -139,7 +115,7 @@ class PriorityScheduler:
 
                 pipe.execute()
 
-            logger.info(f"Deployment {deployment.id} enqueued with priority score {score}")
+            logger.info(f"Deployment {deployment.id} enqueued with priority {deployment.priority}")
             return True
 
         except Exception as e:
@@ -152,6 +128,7 @@ class PriorityScheduler:
             # Get available resources for cluster
             resources = self.get_cluster_resources(cluster_id)
             if not resources:
+                logger.warning(f"No resources available for cluster {cluster_id}")
                 return None
 
             # Get all pending deployments sorted by priority
@@ -190,64 +167,59 @@ class PriorityScheduler:
                 }
 
                 if self.can_schedule(resources, required_resources):
+                    logger.info(f"Found suitable deployment {deployment_id} for cluster {cluster_id}")
                     return {
                         'id': deployment_info['id'],
                         'info': deployment_info,
                         'score': score
                     }
 
+            logger.info(f"No suitable deployments found for cluster {cluster_id}")
             return None
 
         except Exception as e:
             logger.error(f"Error getting next deployment: {str(e)}")
             return None
 
-
-
-
     def process_deployments(self, cluster_id: int) -> List[Dict]:
         """Process deployments for a cluster based on priority"""
         scheduled = []
 
-        while True:
-            next_deployment = self.get_next_deployment(cluster_id)
-            if not next_deployment:
-                break
+        try:
+            while True:
+                next_deployment = self.get_next_deployment(cluster_id)
+                if not next_deployment:
+                    break
 
-            deployment_id = next_deployment['id']
-            deployment_info = next_deployment['info']
+                deployment_id = next_deployment['id']
+                deployment_info = next_deployment['info']
 
-            # Start deployment
-            success = self.start_deployment(
-                cluster_id,
-                int(deployment_id),
-                json.loads(deployment_info['required_resources'])
-            )
+                # Create required_resources dict from deployment_info
+                required_resources = {
+                    'ram': deployment_info['required_ram'],
+                    'cpu': deployment_info['required_cpu'],
+                    'gpu': deployment_info['required_gpu']
+                }
 
-            if success:
-                scheduled.append(deployment_info)
-            else:
-                break
+                # Start deployment
+                success = self.start_deployment(
+                    cluster_id,
+                    int(deployment_id),
+                    required_resources
+                )
 
-        return scheduled
+                if success:
+                    scheduled.append(deployment_info)
+                    logger.info(f"Successfully scheduled deployment {deployment_id}")
+                else:
+                    logger.warning(f"Failed to start deployment {deployment_id}")
+                    break
 
+            return scheduled
 
-
-    def _scale_resources(self, resources: Dict) -> Dict:
-        """Convert float resources to scaled integers"""
-        return {
-            'ram': int(float(resources['ram']) * self.RESOURCE_SCALE),
-            'cpu': int(float(resources['cpu']) * self.RESOURCE_SCALE),
-            'gpu': int(float(resources['gpu']) * self.RESOURCE_SCALE)
-        }
-
-    def _unscale_resources(self, resources: Dict) -> Dict:
-        """Convert scaled integers back to floats"""
-        return {
-            'ram': float(resources['ram']) / self.RESOURCE_SCALE,
-            'cpu': float(resources['cpu']) / self.RESOURCE_SCALE,
-            'gpu': float(resources['gpu']) / self.RESOURCE_SCALE
-        }
+        except Exception as e:
+            logger.error(f"Error processing deployments: {str(e)}")
+            return scheduled
 
     def start_deployment(self, cluster_id: int, deployment_id: int, required_resources: Dict) -> bool:
         """Start a deployment and allocate resources"""
@@ -269,19 +241,136 @@ class PriorityScheduler:
 
             # Update deployment status in database
             deployment = self.db.query(Deployment).get(deployment_id)
+            if not deployment:
+                raise ValueError(f"Deployment {deployment_id} not found")
+
             deployment.status = DeploymentStatus.RUNNING
             deployment.started_at = datetime.utcnow()
             self.db.commit()
 
+            logger.info(f"Started deployment {deployment_id}")
             return True
 
         except Exception as e:
-            logger.error(f"Error starting deployment: {str(e)}")
+            logger.error(f"Error starting deployment {deployment_id}: {str(e)}")
+            self.db.rollback()
             return False
 
+    def complete_deployment(
+            self,
+            deployment_id: int,
+            status: DeploymentStatus,
+            completion_details: Optional[Dict] = None
+    ) -> bool:
+        """Handle deployment completion"""
+        try:
+            # Get deployment from database
+            deployment = self.db.query(Deployment).get(deployment_id)
+            if not deployment:
+                logger.error(f"Deployment {deployment_id} not found")
+                return False
+
+            # Validate status transition
+            if deployment.status == DeploymentStatus.COMPLETED:
+                logger.error(f"Deployment {deployment_id} is already completed")
+                return False
+
+            # Create resources dict from deployment attributes
+            resources = {
+                'ram': deployment.required_ram,
+                'cpu': deployment.required_cpu,
+                'gpu': deployment.required_gpu
+            }
+
+            # Update deployment status in database
+            deployment.status = status
+            deployment.completed_at = datetime.utcnow()
+
+            if completion_details:
+                deployment.completion_details = completion_details
+
+            # Remove from Redis and release resources
+            with self.redis.pipeline() as pipe:
+                # Remove from queue if still there
+                pipe.zrem(self.QUEUE_KEY, str(deployment_id))
+                pipe.delete(self.DEPLOYMENT_KEY.format(deployment_id))
+                pipe.execute()
+
+            # Release cluster resources
+            self.release_resources(deployment.cluster_id, resources)
+
+            # Commit database changes
+            self.db.commit()
+
+            # Process next pending deployments
+            next_deployments = self.process_deployments(deployment.cluster_id)
+            if next_deployments:
+                logger.info(f"Scheduled {len(next_deployments)} deployments after completion")
+
+            logger.info(f"Completed deployment {deployment_id} with status {status}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error completing deployment {deployment_id}: {str(e)}")
+            self.db.rollback()
+            return False
+
+    def release_resources(self, cluster_id: int, resources: Dict) -> None:
+        """Release resources back to the cluster"""
+        try:
+            # Scale resources to integers
+            scaled_resources = self._scale_resources(resources)
+            resource_key = self.RESOURCE_KEY.format(cluster_id)
+
+            # Get current resources
+            current_resources = self.get_cluster_resources(cluster_id)
+            if not current_resources:
+                raise ValueError("Cluster resources not found")
+
+            with self.redis.pipeline() as pipe:
+                pipe.hincrby(resource_key, 'ram', scaled_resources['ram'])
+                pipe.hincrby(resource_key, 'cpu', scaled_resources['cpu'])
+                pipe.hincrby(resource_key, 'gpu', scaled_resources['gpu'])
+                pipe.execute()
+
+            logger.info(f"Released resources for cluster {cluster_id}: {resources}")
+
+        except Exception as e:
+            logger.error(f"Error releasing resources: {str(e)}")
+            raise
+
+    def _scale_resources(self, resources: Dict) -> Dict:
+        """Convert float resources to scaled integers"""
+        return {
+            'ram': int(float(resources['ram']) * self.RESOURCE_SCALE),
+            'cpu': int(float(resources['cpu']) * self.RESOURCE_SCALE),
+            'gpu': int(float(resources['gpu']) * self.RESOURCE_SCALE)
+        }
+
+    def calculate_priority_score(self, priority: int, created_at: datetime) -> float:
+        """Calculate priority score for sorting"""
+        base_score = priority * 10000
+        time_score = created_at.timestamp()
+        return base_score - time_score
+
+    def can_schedule(self, available: Dict, required: Dict) -> bool:
+        """Check if required resources are available"""
+        try:
+            # Scale both available and required resources
+            scaled_available = self._scale_resources(available)
+            scaled_required = self._scale_resources(required)
+
+            return (
+                    scaled_available['ram'] >= scaled_required['ram'] and
+                    scaled_available['cpu'] >= scaled_required['cpu'] and
+                    scaled_available['gpu'] >= scaled_required['gpu']
+            )
+        except Exception as e:
+            logger.error(f"Error checking resource availability: {e}")
+            return False
 
     def get_queue_metrics(self) -> Dict:
-        """Get metrics about the current queue state"""
+        """Get queue metrics"""
         try:
             all_deployments = self.redis.zrevrange(
                 self.QUEUE_KEY,
@@ -304,7 +393,6 @@ class PriorityScheduler:
             for _, score in all_deployments:
                 priority = int(score // 10000)
 
-                # Update priority distribution
                 if priority >= 9:
                     metrics['priority_distribution']['critical'] += 1
                 elif priority >= 7:
@@ -314,7 +402,6 @@ class PriorityScheduler:
                 else:
                     metrics['priority_distribution']['low'] += 1
 
-                # Update highest priority
                 metrics['highest_priority'] = max(
                     metrics['highest_priority'],
                     priority
@@ -326,106 +413,6 @@ class PriorityScheduler:
             logger.error(f"Error getting queue metrics: {str(e)}")
             return {}
 
-    def rebalance_queue(self) -> bool:
-        """Rebalance queue priorities based on waiting time"""
-        try:
-            current_time = datetime.utcnow().timestamp()
-
-            # Get all pending deployments
-            pending = self.redis.zrange(
-                self.QUEUE_KEY,
-                0, -1,
-                withscores=True
-            )
-
-            with self.redis.pipeline() as pipe:
-                for deployment_id, old_score in pending:
-                    info = self.redis.hgetall(
-                        self.DEPLOYMENT_KEY.format(deployment_id)
-                    )
-
-                    if not info:
-                        continue
-
-                    created_at = datetime.fromisoformat(info['created_at'])
-                    wait_time = current_time - created_at.timestamp()
-
-                    # Increase priority for long-waiting deployments
-                    if wait_time > 3600:  # Waiting more than 1 hour
-                        priority = min(int(info['priority']) + 1, 10)
-                        new_score = self.calculate_priority_score(
-                            priority,
-                            created_at
-                        )
-
-                        pipe.zadd(self.QUEUE_KEY, {deployment_id: new_score})
-
-                pipe.execute()
-            return True
-
-        except Exception as e:
-            logger.error(f"Error rebalancing queue: {str(e)}")
-            return False
-
-
-    def complete_deployment(
-            self,
-            deployment_id: int,
-            status: DeploymentStatus,
-            completion_details: Optional[Dict] = None
-    ) -> bool:
-        """
-        Handle deployment completion - marks as complete, releases resources, updates queue
-        """
-        try:
-            # Get deployment
-            deployment = self.db.query(Deployment).get(deployment_id)
-            if not deployment:
-                logger.error(f"Deployment {deployment_id} not found")
-                return False
-
-            # Release resources back to cluster
-            resources = {
-                'ram': deployment.required_ram,
-                'cpu': deployment.required_cpu,
-                'gpu': deployment.required_gpu
-            }
-
-            # Update deployment status in database
-            deployment.status = status
-            deployment.completed_at = datetime.utcnow()
-
-            if completion_details:
-                deployment.completion_details = completion_details
-
-            # Remove from Redis and release resources
-            with self.redis.pipeline() as pipe:
-                # Remove from queue if still there
-                pipe.zrem(self.QUEUE_KEY, str(deployment_id))
-
-                # Remove deployment info
-                pipe.delete(self.DEPLOYMENT_KEY.format(deployment_id))
-
-                pipe.execute()
-
-            # Release cluster resources
-            self.release_resources(deployment.cluster_id, resources)
-
-            # Commit database changes
-            self.db.commit()
-
-            # Process next pending deployments
-            next_deployments = self.process_deployments(deployment.cluster_id)
-            if next_deployments:
-                logger.info(f"Scheduled {len(next_deployments)} deployments after completion")
-
-            logger.info(f"Deployment {deployment_id} completed with status {status}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error completing deployment {deployment_id}: {str(e)}")
-            self.db.rollback()
-            return False
 
     def handle_deployment_timeout(self, deployment_id: int) -> bool:
         """Handle deployments that have timed out"""
@@ -437,13 +424,12 @@ class PriorityScheduler:
             # Check if deployment has exceeded timeout
             if deployment.started_at:
                 elapsed_time = datetime.utcnow() - deployment.started_at
-                if elapsed_time.total_seconds() > 3600:  # 1 hour timeout
+                if elapsed_time.total_seconds() > self.DEPLOYMENT_TIMEOUT:
                     return self.complete_deployment(
                         deployment_id,
                         DeploymentStatus.FAILED,
                         {"reason": "Deployment timed out"}
                     )
-
             return False
 
         except Exception as e:
