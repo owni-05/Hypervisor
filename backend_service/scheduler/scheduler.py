@@ -79,9 +79,30 @@ class PriorityScheduler:
             return {}
 
     def enqueue_deployment(self, deployment: Deployment) -> bool:
-        """Add deployment to priority queue"""
+        """
+        Add deployment to queue only if resources aren't immediately available
+        Returns True if deployment was scheduled or queued successfully
+        """
         try:
-            # Prepare deployment info as a flat dictionary with string values
+            # First check if we can schedule it immediately
+            cluster_resources = self.get_cluster_resources(deployment.cluster_id)
+            required_resources = {
+                'ram': deployment.required_ram,
+                'cpu': deployment.required_cpu,
+                'gpu': deployment.required_gpu
+            }
+
+            # If resources are available, start deployment immediately
+            if self.can_schedule(cluster_resources, required_resources):
+                logger.info(f"Resources available for deployment {deployment.id}, starting immediately")
+                return self.start_deployment(
+                    deployment.cluster_id,
+                    deployment.id,
+                    required_resources
+                )
+
+            # If resources aren't available, queue the deployment
+            logger.info(f"Resources not available for deployment {deployment.id}, adding to queue")
             deployment_info = {
                 'id': str(deployment.id),
                 'name': deployment.name,
@@ -99,27 +120,28 @@ class PriorityScheduler:
                 deployment.created_at
             )
 
-            # Use Redis transaction to ensure atomic operations
+            # Add to queue using Redis transaction
             with self.redis.pipeline() as pipe:
-                # Store deployment info using hset
                 pipe.hset(
                     self.DEPLOYMENT_KEY.format(deployment.id),
                     mapping=deployment_info
                 )
-
-                # Add to priority queue
                 pipe.zadd(
                     self.QUEUE_KEY,
                     {str(deployment.id): score}
                 )
-
                 pipe.execute()
 
-            logger.info(f"Deployment {deployment.id} enqueued with priority {deployment.priority}")
+            # Update deployment status to QUEUED in database
+            deployment.status = DeploymentStatus.QUEUED
+            self.db.commit()
+
+            logger.info(f"Deployment {deployment.id} queued with priority {deployment.priority}")
             return True
 
         except Exception as e:
-            logger.error(f"Error enqueueing deployment: {str(e)}")
+            logger.error(f"Error handling deployment {deployment.id}: {str(e)}")
+            self.db.rollback()
             return False
 
     def get_next_deployment(self, cluster_id: int) -> Optional[Dict]:
@@ -182,10 +204,18 @@ class PriorityScheduler:
             return None
 
     def process_deployments(self, cluster_id: int) -> List[Dict]:
-        """Process deployments for a cluster based on priority"""
+        """
+        Process queued deployments for a cluster based on priority
+        Only called when resources become available
+        """
         scheduled = []
 
         try:
+            resources = self.get_cluster_resources(cluster_id)
+            if not resources:
+                logger.warning(f"No resources found for cluster {cluster_id}")
+                return scheduled
+
             while True:
                 next_deployment = self.get_next_deployment(cluster_id)
                 if not next_deployment:
@@ -194,12 +224,16 @@ class PriorityScheduler:
                 deployment_id = next_deployment['id']
                 deployment_info = next_deployment['info']
 
-                # Create required_resources dict from deployment_info
                 required_resources = {
                     'ram': deployment_info['required_ram'],
                     'cpu': deployment_info['required_cpu'],
                     'gpu': deployment_info['required_gpu']
                 }
+
+                # Double-check resources are still available
+                if not self.can_schedule(resources, required_resources):
+                    logger.info(f"Resources no longer available for deployment {deployment_id}")
+                    break
 
                 # Start deployment
                 success = self.start_deployment(
@@ -210,7 +244,10 @@ class PriorityScheduler:
 
                 if success:
                     scheduled.append(deployment_info)
-                    logger.info(f"Successfully scheduled deployment {deployment_id}")
+                    logger.info(f"Successfully scheduled queued deployment {deployment_id}")
+
+                    # Update available resources for next iteration
+                    resources = self.get_cluster_resources(cluster_id)
                 else:
                     logger.warning(f"Failed to start deployment {deployment_id}")
                     break

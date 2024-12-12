@@ -23,7 +23,7 @@ def test_service():
     headers = {"Authorization": f"Bearer {token}"}
 
     # 3. Create an organization
-    org_data = {"name": "Test Organization 9"}
+    org_data = {"name": "Test Organization 10"}
     org_response = requests.post(
         f"{BASE_URL}/organizations/",
         headers=headers,
